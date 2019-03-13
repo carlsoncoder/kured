@@ -37,6 +37,7 @@ var (
 	slackHookURL   string
 	slackUsername  string
 	podSelectors   []string
+	isWindows      bool
 
 	// Metrics
 	rebootRequiredGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -44,6 +45,11 @@ var (
 		Name:      "reboot_required",
 		Help:      "OS requires reboot due to software updates.",
 	}, []string{"node"})
+)
+
+const (
+	windowsKubectlLocation string = "C:\\tools\\kubectl"
+	linuxKubectlLocation   string = "/usr/bin/kubectl"
 )
 
 func init() {
@@ -79,6 +85,9 @@ func main() {
 	rootCmd.PersistentFlags().StringArrayVar(&podSelectors, "blocking-pod-selector", nil,
 		"label selector identifying pods whose presence should prevent reboots")
 
+	rootCmd.PersistentFlags().BoolVar(&isWindows, "is-windows", false,
+		"whether or not this instance of kured is operating on Windows servers")
+
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)
 	}
@@ -102,8 +111,14 @@ func newCommand(name string, arg ...string) *exec.Cmd {
 }
 
 func sentinelExists() bool {
-	// Relies on hostPID:true and privileged:true to enter host mount space
-	sentinelCmd := newCommand("/usr/bin/nsenter", "-m/proc/1/ns/mnt", "--", "/usr/bin/test", "-f", rebootSentinel)
+	var sentinelCmd *exec.Cmd
+	if isWindows {
+		sentinelCmd = newCommand("cmd", "/c", "REG", "QUERY", "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired")
+	} else {
+		// Relies on hostPID:true and privileged:true to enter host mount space
+		sentinelCmd = newCommand("/usr/bin/nsenter", "-m/proc/1/ns/mnt", "--", "/usr/bin/test", "-f", rebootSentinel)
+	}
+
 	if err := sentinelCmd.Run(); err != nil {
 		switch err := err.(type) {
 		case *exec.ExitError:
@@ -118,6 +133,7 @@ func sentinelExists() bool {
 			log.Fatalf("Error invoking sentinel command: %v", err)
 		}
 	}
+
 	return true
 }
 
@@ -217,7 +233,8 @@ func drain(nodeID string) {
 		}
 	}
 
-	drainCmd := newCommand("/usr/bin/kubectl", "drain",
+	kubectlLocation := determineKubectlLocation()
+	drainCmd := newCommand(kubectlLocation, "drain",
 		"--ignore-daemonsets", "--delete-local-data", "--force", nodeID)
 
 	if err := drainCmd.Run(); err != nil {
@@ -227,10 +244,23 @@ func drain(nodeID string) {
 
 func uncordon(nodeID string) {
 	log.Infof("Uncordoning node %s", nodeID)
-	uncordonCmd := newCommand("/usr/bin/kubectl", "uncordon", nodeID)
+
+	kubectlLocation := determineKubectlLocation()
+	uncordonCmd := newCommand(kubectlLocation, "uncordon", nodeID)
 	if err := uncordonCmd.Run(); err != nil {
 		log.Fatalf("Error invoking uncordon command: %v", err)
 	}
+}
+
+func determineKubectlLocation() string {
+	var kubectlLocation string
+	if isWindows {
+		kubectlLocation = windowsKubectlLocation
+	} else {
+		kubectlLocation = linuxKubectlLocation
+	}
+
+	return kubectlLocation
 }
 
 func commandReboot(nodeID string) {
@@ -242,8 +272,14 @@ func commandReboot(nodeID string) {
 		}
 	}
 
-	// Relies on hostPID:true and privileged:true to enter host mount space
-	rebootCmd := newCommand("/usr/bin/nsenter", "-m/proc/1/ns/mnt", "/bin/systemctl", "reboot")
+	var rebootCmd *exec.Cmd
+	if isWindows {
+		rebootCmd = newCommand("cmd", "/c", "shutdown", "/r", "/t", "60", "/c", "kured forcing reboot due to pending Windows updates")
+	} else {
+		// Relies on hostPID:true and privileged:true to enter host mount space
+		rebootCmd = newCommand("/usr/bin/nsenter", "-m/proc/1/ns/mnt", "/bin/systemctl", "reboot")
+	}
+
 	if err := rebootCmd.Run(); err != nil {
 		log.Fatalf("Error invoking reboot command: %v", err)
 	}
